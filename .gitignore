@@ -1,0 +1,8 @@
+deploy/bicep/main.json
+deploy/bicep/existing.bicepparam
+deploy/bicep/*.local.bicepparam
+inventory-report*.json
+audit-report*.json
+*.log
+.DS_Store
+.vscode/

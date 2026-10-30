@@ -1,0 +1,542 @@
+$ErrorActionPreference = 'Stop'
+
+# Runs scripts/inventory.ps1 against canned Azure CLI responses; no Azure calls are made.
+
+$repositoryRoot = Split-Path $PSScriptRoot -Parent
+$inventoryScript = Join-Path $repositoryRoot 'scripts/inventory.ps1'
+$realAz = (Get-Command az -CommandType Application | Select-Object -First 1).Source
+$subscription = '/subscriptions/00000000-0000-0000-0000-000000000000'
+$fakeAzRules = @()
+$global:InventoryAzCalls = [System.Collections.Generic.List[string]]::new()
+
+function az {
+    $joined = $args -join ' '
+    $global:InventoryAzCalls.Add($joined)
+    if ($args[0] -eq 'bicep') {
+        & $realAz @args
+        return
+    }
+    foreach ($rule in $fakeAzRules) {
+        if ($joined -like $rule.Pattern) {
+            if ($rule.ExitCode -ne 0) {
+                $global:LASTEXITCODE = $rule.ExitCode
+                Write-Error $rule.Response -ErrorAction Continue
+                return
+            }
+            $global:LASTEXITCODE = 0
+            return (ConvertTo-Json -InputObject $rule.Response -Depth 20 -Compress)
+        }
+    }
+    $global:LASTEXITCODE = 3
+    Write-Error "ERROR: (ResourceNotFound) No test fixture for: $joined" -ErrorAction Continue
+}
+
+function New-Rule([string]$Pattern, $Response, [int]$ExitCode = 0) {
+    [pscustomobject]@{ Pattern = $Pattern; Response = $Response; ExitCode = $ExitCode }
+}
+
+function Invoke-Inventory([string]$ParametersFile, [string[]]$ParameterOverrides = @()) {
+    $reportPath = Join-Path ([IO.Path]::GetTempPath()) "inventory-report-$([guid]::NewGuid().ToString('N')).json"
+    $global:InventoryAzCalls.Clear()
+    try {
+        & $inventoryScript -ParametersFile $ParametersFile -OutputPath $reportPath -ParameterOverrides $ParameterOverrides 6> $null
+        return Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -Depth 20
+    } finally {
+        Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-WhatIfCall {
+    return @($global:InventoryAzCalls | Where-Object { $_ -like 'deployment sub what-if*' }) | Select-Object -First 1
+}
+
+function Assert-True([bool]$Condition, [string]$Message) {
+    if (-not $Condition) {
+        throw "inventory check failed: $Message"
+    }
+}
+
+function Get-Status($Report, [string]$ItemPattern) {
+    return @($Report.Prerequisites | Where-Object { $_.Item -like $ItemPattern } | ForEach-Object { $_.Status })
+}
+
+function Get-PermissionRows($Report) {
+    return @($Report.Prerequisites | Where-Object Area -eq 'Permissions')
+}
+
+# Permissions API responses: one entry per role assignment that applies to the caller at the scope.
+$ownerPermissions = @{ value = @(@{ actions = @('*'); notActions = @() }) }
+$contributorPermissions = @{ actions = @('*'); notActions = @('Microsoft.Authorization/*/Delete', 'Microsoft.Authorization/*/Write', 'Microsoft.Authorization/elevateAccess/Action') }
+$rbacAdministratorPermissions = @{ actions = @('Microsoft.Authorization/roleAssignments/write', 'Microsoft.Authorization/roleAssignments/delete', '*/read'); notActions = @() }
+
+$commonRules = @(
+    (New-Rule 'account show*' @{ id = '00000000-0000-0000-0000-000000000000'; name = 'Test subscription'; tenantId = '11111111-1111-1111-1111-111111111111' }),
+    (New-Rule 'cloud show*' @{ suffixes = @{ storageEndpoint = 'core.windows.net' } }),
+    (New-Rule 'provider show --namespace*' @{
+        registrationState = 'Registered'
+        resourceTypes     = @(@{ resourceType = 'managedEnvironments'; locations = @('South Central US', 'West US', 'West US 2', 'North Central US') })
+    }),
+    (New-Rule 'rest --method get --url */providers/Microsoft.Authorization/permissions *' $ownerPermissions)
+)
+
+# Greenfield: every resource is new.
+$greenfieldRules = @(
+    (New-Rule 'rest --method get --url *Microsoft.Storage/skus*' @{ value = @(
+        @{ name = 'Standard_ZRS'; kind = 'StorageV2'; locations = @('southcentralus'); restrictions = @() },
+        @{ name = 'Standard_LRS'; kind = 'StorageV2'; locations = @('westus'); restrictions = @() }
+    ) }),
+    (New-Rule 'deployment sub what-if*' @{ status = 'Succeeded'; changes = @(
+        @{ changeType = 'Create'; resourceId = "$subscription/resourceGroups/rg-azure-files-replication-demo" },
+        @{ changeType = 'Create'; resourceId = "$subscription/resourceGroups/rg-azure-files-replication-demo/providers/Microsoft.App/jobs/job-sync-primary" },
+        @{ changeType = 'Create'; resourceId = "$subscription/resourceGroups/rg-azure-files-replication-demo/providers/Microsoft.Storage/storageAccounts/stfileprimary/providers/Microsoft.Authorization/roleAssignments/role-1" }
+    ) })
+)
+$fakeAzRules = $commonRules + $greenfieldRules
+$report = Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam')
+Assert-True ($report.Profile -like 'greenfield*') 'main.bicepparam must be detected as the greenfield profile'
+Assert-True ($report.Summary.ResourcesToProvision -eq 3) "greenfield resources to provision were $($report.Summary.ResourcesToProvision)"
+Assert-True ((Get-Status $report 'Standard_ZRS in southcentralus') -contains 'Ready') 'ZRS availability was not reported as ready'
+Assert-True ((Get-Status $report 'alertEmailAddresses') -contains 'Warning') 'the example alert address was not flagged'
+$roleAssignment = @($report.Resources | Where-Object Type -eq 'Microsoft.Authorization/roleAssignments')
+Assert-True ($roleAssignment.Count -eq 1 -and $roleAssignment[0].Name -eq 'role-1 on stfileprimary') 'role assignment scope was not described'
+Assert-True ((Get-WhatIfCall) -notlike '*--parameters activeRegion*') 'what-if must not add parameters when no overrides are given'
+
+# The workload resource group doesn't exist yet, so the right to assign roles must come from the subscription.
+$permissionRows = Get-PermissionRows $report
+Assert-True ($permissionRows.Count -eq 1 -and $permissionRows[0].Status -eq 'Ready' -and $permissionRows[0].Item -eq 'Role assignments on subscription Test subscription') "greenfield role assignment rights were not checked at the subscription: $($permissionRows | ConvertTo-Json -Compress)"
+Assert-True ($permissionRows[0].Detail -like '*Storage File Data Privileged Contributor and AcrPull*' -and $permissionRows[0].Detail -like '*creates resource group rg-azure-files-replication-demo*') "greenfield permission detail: $($permissionRows[0].Detail)"
+Assert-True (@($global:InventoryAzCalls | Where-Object { $_ -like "rest --method get --url $subscription/providers/Microsoft.Authorization/permissions --url-parameters api-version=2022-04-01*" }).Count -eq 1) 'the permissions API was not called once at the subscription'
+
+# Contributor can deploy resources but not assign roles: its notActions exclude Microsoft.Authorization/*/Write.
+$fakeAzRules = @((New-Rule 'rest --method get --url */providers/Microsoft.Authorization/permissions *' @{ value = @($contributorPermissions) })) + $commonRules + $greenfieldRules + @(
+    (New-Rule 'group show --name rg-azure-files-replication-demo *' @{ name = 'rg-azure-files-replication-demo' })
+)
+$report = Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam')
+$permissionRows = Get-PermissionRows $report
+Assert-True ($permissionRows.Count -eq 1 -and $permissionRows[0].Status -eq 'Action required' -and $permissionRows[0].Item -eq 'Role assignments on resource group rg-azure-files-replication-demo') "Contributor-only access was not flagged at the existing workload group: $($permissionRows | ConvertTo-Json -Compress)"
+Assert-True ($permissionRows[0].Detail -like '*Privileged Identity Management*') 'the permission finding does not mention eligible roles'
+
+# A failed permissions lookup is reported as not verified.
+$fakeAzRules = @((New-Rule 'rest --method get --url */providers/Microsoft.Authorization/permissions *' 'ERROR: (AuthorizationFailed) The client does not have authorization.' 1)) + $commonRules + $greenfieldRules
+$report = Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam')
+Assert-True ((Get-PermissionRows $report | ForEach-Object Status) -contains 'Not verified') 'a failed permissions lookup was not reported as not verified'
+
+# With createRoleAssignments = false, a Contributor-level identity can deploy; an administrator grants the roles afterward.
+$fakeAzRules = @((New-Rule 'rest --method get --url */providers/Microsoft.Authorization/permissions *' @{ value = @($contributorPermissions) })) + $commonRules + $greenfieldRules
+$report = Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam') @('createRoleAssignments=false')
+$permissionRows = Get-PermissionRows $report
+Assert-True ($permissionRows.Count -eq 2 -and (Get-Status $report 'Role assignments') -contains 'Ready' -and (Get-Status $report 'Job identity roles') -contains 'To be created') "separately granted roles were not reported: $($permissionRows | ConvertTo-Json -Compress)"
+Assert-True (@($permissionRows | Where-Object Item -eq 'Job identity roles')[0].Detail -like '*grant-access.ps1 -DeploymentName*') 'the grant step was not named'
+Assert-True (@($global:InventoryAzCalls | Where-Object { $_ -like 'rest --method get --url */providers/Microsoft.Authorization/permissions *' }).Count -eq 0) 'role assignment rights were checked although the deployment creates no role assignments'
+Assert-True ($report.Summary.PrerequisitesActionRequired -eq 0) 'a deploying identity without role assignment rights was flagged'
+$fakeAzRules = $commonRules + $greenfieldRules
+
+# Overrides reach what-if as extra --parameters values; names the template doesn't declare are dropped.
+$report = Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam') @('activeRegion=primary', 'acrPublicNetworkAccess=Disabled', 'notDeclared=1')
+$whatIfCall = Get-WhatIfCall
+Assert-True ($whatIfCall -like '*--parameters activeRegion=primary acrPublicNetworkAccess=Disabled --result-format*') "what-if did not receive the overrides: $whatIfCall"
+Assert-True ($whatIfCall -notlike '*notDeclared*') 'an undeclared override was passed to what-if'
+Assert-True ((@($report.ParameterOverrides) -join ',') -eq 'activeRegion=primary,acrPublicNetworkAccess=Disabled') "report overrides were $(@($report.ParameterOverrides) -join ',')"
+$invalidOverrideRejected = $false
+try {
+    Invoke-Inventory (Join-Path $repositoryRoot 'deploy/bicep/main.bicepparam') @('activeRegion') | Out-Null
+} catch {
+    $invalidOverrideRejected = $_.Exception.Message -match 'name=value'
+}
+Assert-True $invalidOverrideRejected 'an override without a value was accepted'
+
+# Existing resources: copy the templates so the test parameter file can reference them.
+$workRoot = Join-Path ([IO.Path]::GetTempPath()) "inventory-test-$([guid]::NewGuid().ToString('N'))"
+Copy-Item -Path (Join-Path $repositoryRoot 'deploy/bicep') -Destination $workRoot -Recurse
+$parametersFile = Join-Path $workRoot 'existing.test.bicepparam'
+$digest = 'a' * 64
+@"
+using './existing.bicep'
+
+param resourceGroupName = 'rg-replication-test'
+param resourceGroupLocation = 'westus2'
+param primaryLocation = 'westus2'
+param secondaryLocation = 'northcentralus'
+param primaryRegionCode = 'pri'
+param secondaryRegionCode = 'sec'
+param primaryStorageAccountName = 'stprimarytest'
+param primaryStorageResourceGroupName = 'rg-storage-primary'
+param primaryFileShareName = 'share'
+param secondaryStorageAccountName = 'stsecondarytest'
+param secondaryStorageResourceGroupName = 'rg-storage-secondary'
+param secondaryFileShareName = 'share'
+param primaryVnetName = 'vnet-primary'
+param primaryVnetResourceGroupName = 'rg-network-primary'
+param primaryInfrastructureSubnetName = 'snet-jobs'
+param secondaryVnetName = 'vnet-secondary'
+param secondaryVnetResourceGroupName = 'rg-network-secondary'
+param secondaryInfrastructureSubnetName = 'snet-jobs'
+param registryName = 'acrtest'
+param registryResourceGroupName = 'rg-registry'
+param existingPrivateEndpointIds = ['$subscription/resourceGroups/rg-network-primary/providers/Microsoft.Network/privateEndpoints/pe-primary-file-a']
+param containerImage = 'acrtest.azurecr.io/azure-files-dr-azcopy@sha256:$digest'
+param alertEmailAddresses = ['alerts@replication.test']
+"@ | Set-Content -LiteralPath $parametersFile -Encoding utf8
+
+function Get-ExistingRules([string[]]$PrimaryEndpoints, [string[]]$SecondaryEndpoints) {
+    $vnetPrimary = "$subscription/resourceGroups/rg-network-primary/providers/Microsoft.Network/virtualNetworks/vnet-primary"
+    $vnetSecondary = "$subscription/resourceGroups/rg-network-secondary/providers/Microsoft.Network/virtualNetworks/vnet-secondary"
+    $endpoints = @{
+        'pe-primary-file-a'   = @{ Vnet = $vnetPrimary; Group = 'file'; Ip = '10.1.2.4' }
+        'pe-secondary-file-a' = @{ Vnet = $vnetPrimary; Group = 'file'; Ip = '10.1.2.5' }
+        'pe-acr-a'            = @{ Vnet = $vnetPrimary; Group = 'registry'; Ip = '10.1.2.6' }
+        'pe-secondary-file-b' = @{ Vnet = $vnetSecondary; Group = 'file'; Ip = '10.2.2.4' }
+        'pe-primary-file-b'   = @{ Vnet = $vnetSecondary; Group = 'file'; Ip = '10.2.2.5' }
+        'pe-acr-b'            = @{ Vnet = $vnetSecondary; Group = 'registry'; Ip = '10.2.2.6' }
+    }
+    function Get-Connections([string[]]$Names) {
+        @($Names | ForEach-Object { @{ privateEndpoint = @{ id = "$subscription/resourceGroups/rg-network/providers/Microsoft.Network/privateEndpoints/$_" }; privateLinkServiceConnectionState = @{ status = 'Approved' } } })
+    }
+
+    $rules = @(
+        (New-Rule 'storage account show --name stprimarytest*' @{ location = 'westus2'; kind = 'StorageV2'; sku = @{ name = 'Standard_ZRS' }; publicNetworkAccess = 'Disabled'; privateEndpointConnections = (Get-Connections $PrimaryEndpoints) }),
+        (New-Rule 'storage account show --name stsecondarytest*' @{ location = 'northcentralus'; kind = 'StorageV2'; sku = @{ name = 'Standard_LRS' }; publicNetworkAccess = 'Disabled'; privateEndpointConnections = (Get-Connections $SecondaryEndpoints) }),
+        (New-Rule 'storage share-rm show --resource-group rg-storage-primary*' @{ enabledProtocols = 'SMB'; shareQuota = 100; shareUsageBytes = 1073741824 }),
+        (New-Rule 'storage share-rm show --resource-group rg-storage-secondary*' @{ enabledProtocols = 'SMB'; shareQuota = 100; shareUsageBytes = 0 }),
+        (New-Rule 'network vnet show --resource-group rg-network-primary*' @{ id = $vnetPrimary; location = 'westus2'; dhcpOptions = @{ dnsServers = @() }; virtualNetworkPeerings = @() }),
+        (New-Rule 'network vnet show --resource-group rg-network-secondary*' @{ id = $vnetSecondary; location = 'northcentralus'; dhcpOptions = @{ dnsServers = @() }; virtualNetworkPeerings = @() }),
+        (New-Rule 'network vnet subnet show*' @{ addressPrefix = '10.0.0.0/23'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); serviceAssociationLinks = @() }),
+        (New-Rule 'acr show --name acrtest*' @{ loginServer = 'acrtest.azurecr.io'; sku = @{ name = 'Premium' }; publicNetworkAccess = 'Disabled'; privateEndpointConnections = (Get-Connections @('pe-acr-a', 'pe-acr-b')) }),
+        (New-Rule 'acr manifest show-metadata*' @{ digest = "sha256:$digest" }),
+        (New-Rule 'network private-dns zone list*' @(
+            @{ name = 'privatelink.file.core.windows.net'; resourceGroup = 'rg-dns-primary' },
+            @{ name = 'privatelink.file.core.windows.net'; resourceGroup = 'rg-dns-secondary' }
+        )),
+        (New-Rule 'network private-dns link vnet list --resource-group rg-dns-primary *' @(@{ virtualNetwork = @{ id = $vnetPrimary } })),
+        (New-Rule 'network private-dns link vnet list --resource-group rg-dns-secondary *' @(@{ virtualNetwork = @{ id = $vnetSecondary } })),
+        (New-Rule 'network private-dns record-set a show --resource-group rg-dns-primary * --name stprimarytest*' @{ aRecords = @(@{ ipv4Address = '10.1.2.4' }) }),
+        (New-Rule 'network private-dns record-set a show --resource-group rg-dns-primary * --name stsecondarytest*' @{ aRecords = @(@{ ipv4Address = '10.1.2.5' }) }),
+        (New-Rule 'network private-dns record-set a show --resource-group rg-dns-secondary * --name stsecondarytest*' @{ aRecords = @(@{ ipv4Address = '10.2.2.4' }) }),
+        (New-Rule 'network private-dns record-set a show --resource-group rg-dns-secondary * --name stprimarytest*' @{ aRecords = @(@{ ipv4Address = '10.2.2.5' }) }),
+        (New-Rule 'deployment sub what-if*' @{ status = 'Succeeded'; changes = @(
+            @{ changeType = 'Create'; resourceId = "$subscription/resourceGroups/rg-replication-test/providers/Microsoft.App/jobs/job-sync-pri" },
+            @{ changeType = 'NoChange'; resourceId = "$subscription/resourceGroups/rg-replication-test" }
+        ) })
+    )
+    foreach ($name in $endpoints.Keys) {
+        $endpoint = $endpoints[$name]
+        $rules += New-Rule "network private-endpoint show --ids */$name *" @{
+            subnet                       = @{ id = "$($endpoint.Vnet)/subnets/snet-endpoints" }
+            privateLinkServiceConnections = @(@{ groupIds = @($endpoint.Group) })
+            networkInterfaces            = @(@{ id = "$subscription/resourceGroups/rg-network/providers/Microsoft.Network/networkInterfaces/nic-$name" })
+        }
+        $rules += New-Rule "network nic show --ids */nic-$name *" @{ ipConfigurations = @(@{ privateIPAddress = $endpoint.Ip }) }
+    }
+    return $rules
+}
+
+try {
+    $fakeAzRules = $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    Assert-True ($report.Profile -like 'existing*') 'the test parameter file must be detected as the existing-resource profile'
+    Assert-True ((Get-Status $report 'primary job copy path*') -contains 'Ready') 'the local-endpoint layout was not accepted for the primary job'
+    Assert-True ((Get-Status $report 'secondary job copy path*') -contains 'Ready') 'the local-endpoint layout was not accepted for the secondary job'
+    Assert-True (@(Get-Status $report '*DNS for file endpoints*' | Where-Object { $_ -ne 'Ready' }).Count -eq 0) 'DNS records that match local endpoints were not accepted'
+    Assert-True ((Get-Status $report 'containerImage') -contains 'Ready') 'the digest-pinned image was not accepted'
+    Assert-True ((Get-Status $report 'primary outbound access from snet-jobs') -contains 'Ready') 'a job subnet without a route table was not accepted'
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 0) "unexpected action items: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+    Assert-True ($report.Summary.ResourcesToProvision -eq 1 -and $report.Summary.ResourcesExisting -eq 1) 'what-if results were not classified'
+    $permissionItems = @(Get-PermissionRows $report | Where-Object Status -eq 'Ready' | ForEach-Object Item)
+    Assert-True ($permissionItems.Count -eq 3 -and $permissionItems -contains 'Role assignments on primary storage account stprimarytest' -and $permissionItems -contains 'Role assignments on secondary storage account stsecondarytest' -and $permissionItems -contains 'Role assignments on registry acrtest') "role assignment rights were not checked on each reused resource: $($permissionItems -join '; ')"
+    Assert-True (@($global:InventoryAzCalls | Where-Object { $_ -like "rest --method get --url $subscription/resourceGroups/rg-storage-primary/providers/Microsoft.Storage/storageAccounts/stprimarytest/providers/Microsoft.Authorization/permissions *" }).Count -eq 1) 'the storage account permissions were not read at the account scope'
+
+    # Role Based Access Control Administrator on the accounts grants the right even with Contributor's exclusions; the registry has only Contributor.
+    $mixedRules = @(
+        (New-Rule 'rest --method get --url */storageAccounts/*/providers/Microsoft.Authorization/permissions *' @{ value = @($contributorPermissions, $rbacAdministratorPermissions) }),
+        (New-Rule 'rest --method get --url */registries/acrtest/providers/Microsoft.Authorization/permissions *' @{ value = @($contributorPermissions) })
+    )
+    $fakeAzRules = $mixedRules + $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    Assert-True ((Get-Status $report 'Role assignments on primary storage account stprimarytest') -contains 'Ready') 'a constrained administrator assignment on the account was not accepted'
+    $registryRow = @(Get-PermissionRows $report | Where-Object Item -eq 'Role assignments on registry acrtest')
+    Assert-True ($registryRow.Count -eq 1 -and $registryRow[0].Status -eq 'Action required' -and $registryRow[0].Detail -like '*assigns AcrPull*') "missing registry role assignment rights were not flagged: $($registryRow | ConvertTo-Json -Compress)"
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 1) "unexpected action items with missing registry rights: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+
+    # Reused identities with separately granted roles: the deploying identity needs no role assignment rights, but it must
+    # be able to assign the identities, and the identities' roles on the existing services are checked.
+    $identityRoot = "$subscription/resourceGroups/rg-identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities"
+    $separatedOverrides = @('createRoleAssignments=false', 'identityMode=existing', "primaryIdentityId=$identityRoot/id-replication-pri", "secondaryIdentityId=$identityRoot/id-replication-sec")
+    $fileRole = "$subscription/providers/Microsoft.Authorization/roleDefinitions/69566ab7-960f-475b-8e7c-b3118f30c6bd"
+    $pullRole = "$subscription/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    $identityRules = @(
+        (New-Rule "identity show --ids $identityRoot/id-replication-pri *" @{ name = 'id-replication-pri'; principalId = '22222222-2222-2222-2222-222222222222' }),
+        (New-Rule "identity show --ids $identityRoot/id-replication-sec *" @{ name = 'id-replication-sec'; principalId = '33333333-3333-3333-3333-333333333333' }),
+        (New-Rule 'role assignment list --scope */storageAccounts/* *' @($fileRole)),
+        (New-Rule 'role assignment list --scope */registries/acrtest --assignee-object-id 2222* *' @()),
+        (New-Rule 'role assignment list --scope */registries/acrtest --assignee-object-id 3333* *' @($pullRole))
+    )
+    $fakeAzRules = $identityRules + $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile $separatedOverrides
+    Assert-True ((Get-Status $report 'primary job identity id-replication-pri') -contains 'Ready') 'a reused identity that the deploying identity can assign was not accepted'
+    Assert-True ((Get-Status $report 'Role assignments') -contains 'Ready') 'separately granted roles were not explained'
+    Assert-True ((Get-Status $report 'Job identity roles on primary storage account stprimarytest') -contains 'Ready') 'granted storage roles were not accepted'
+    $registryRow = @($report.Prerequisites | Where-Object Item -eq 'Job identity roles on registry acrtest')
+    Assert-True ($registryRow.Count -eq 1 -and $registryRow[0].Status -eq 'Action required' -and $registryRow[0].Detail -like '*id-replication-pri lacks AcrPull*') "a missing AcrPull grant was not flagged: $($registryRow | ConvertTo-Json -Compress)"
+    Assert-True ($registryRow[0].Detail -like "*grant-access.ps1 -IdentityId $identityRoot/id-replication-pri,$identityRoot/id-replication-sec -StorageAccountId *stprimarytest,*stsecondarytest -RegistryId */registries/acrtest") "the grant command is incomplete: $($registryRow[0].Detail)"
+    Assert-True (@($report.Prerequisites | Where-Object Item -like 'Role assignments on *').Count -eq 0) 'role assignment rights were checked although the deployment creates no role assignments'
+    Assert-True (@($global:InventoryAzCalls | Where-Object { $_ -like 'rest --method get --url */storageAccounts/*/providers/Microsoft.Authorization/permissions *' }).Count -eq 0) 'the permissions API was read for the storage accounts'
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 1) "unexpected action items with separately granted roles: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+
+    # Attaching a reused identity to a job needs Microsoft.ManagedIdentity/userAssignedIdentities/assign/action, which
+    # Managed Identity Operator grants as userAssignedIdentities/*/assign/action.
+    $identityOperatorPermissions = @{ actions = @('Microsoft.ManagedIdentity/userAssignedIdentities/*/read', 'Microsoft.ManagedIdentity/userAssignedIdentities/*/assign/action', 'Microsoft.Authorization/*/read', 'Microsoft.Insights/alertRules/*', 'Microsoft.Resources/subscriptions/resourceGroups/read', 'Microsoft.Resources/deployments/*', 'Microsoft.Support/*'); notActions = @() }
+    $operatorRule = New-Rule 'rest --method get --url */userAssignedIdentities/id-replication-pri/providers/Microsoft.Authorization/permissions *' @{ value = @($identityOperatorPermissions) }
+    $readerRule = New-Rule 'rest --method get --url */userAssignedIdentities/id-replication-sec/providers/Microsoft.Authorization/permissions *' @{ value = @(@{ actions = @('*/read'); notActions = @() }) }
+    $fakeAzRules = @($operatorRule, $readerRule) + $identityRules + $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile $separatedOverrides
+    Assert-True ((Get-Status $report 'primary job identity id-replication-pri') -contains 'Ready') 'Managed Identity Operator was not accepted for attaching a reused identity'
+    $identityRow = @($report.Prerequisites | Where-Object Item -eq 'secondary job identity id-replication-sec')
+    Assert-True ($identityRow.Count -eq 1 -and $identityRow[0].Status -eq 'Action required' -and $identityRow[0].Detail -like '*Managed Identity Operator*') "a reused identity that can't be assigned was not flagged: $($identityRow | ConvertTo-Json -Compress)"
+
+    # Reused Log Analytics workspaces, for example when Azure Policy blocks new ones, can be in another subscription and
+    # region. The deployment reads their shared keys, so the deploying identity needs sharedKeys/action on them.
+    $workspaceRoot = '/subscriptions/44444444-4444-4444-4444-444444444444/resourceGroups/rg-central-logs/providers/Microsoft.OperationalInsights/workspaces'
+    $workspaceRules = @(
+        (New-Rule "resource show --ids $workspaceRoot/log-central *" @{ name = 'log-central'; location = 'centralus' }),
+        (New-Rule "resource show --ids $workspaceRoot/log-readonly *" @{ name = 'log-readonly'; location = 'centralus' }),
+        (New-Rule "resource show --ids $workspaceRoot/log-missing *" "ERROR: (ResourceNotFound) The Resource 'Microsoft.OperationalInsights/workspaces/log-missing' under resource group 'rg-central-logs' was not found." 3),
+        (New-Rule 'rest --method get --url */workspaces/log-readonly/providers/Microsoft.Authorization/permissions *' @{ value = @(@{ actions = @('*/read'); notActions = @() }) })
+    )
+    $fakeAzRules = $workspaceRules + $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile @("primaryLogWorkspaceId=$workspaceRoot/log-central", "secondaryLogWorkspaceId=$workspaceRoot/log-readonly")
+    $workspaceRow = @($report.Prerequisites | Where-Object Item -eq 'primary log workspace log-central')
+    Assert-True ($workspaceRow.Count -eq 1 -and $workspaceRow[0].Status -eq 'Ready' -and $workspaceRow[0].Detail -like '*freshness alert is created in centralus*') "a reused workspace whose keys can be read was not accepted: $($workspaceRow | ConvertTo-Json -Compress)"
+    $workspaceRow = @($report.Prerequisites | Where-Object Item -eq 'secondary log workspace log-readonly')
+    Assert-True ($workspaceRow.Count -eq 1 -and $workspaceRow[0].Status -eq 'Action required' -and $workspaceRow[0].Detail -like '*Log Analytics Contributor*') "a reused workspace whose keys can't be read was not flagged: $($workspaceRow | ConvertTo-Json -Compress)"
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 1) "unexpected action items with reused workspaces: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+    $report = Invoke-Inventory $parametersFile @("primaryLogWorkspaceId=$workspaceRoot/log-missing")
+    $workspaceRow = @($report.Prerequisites | Where-Object Item -eq 'primary log workspace log-missing')
+    Assert-True ($workspaceRow.Count -eq 1 -and $workspaceRow[0].Status -eq 'Action required' -and $workspaceRow[0].Detail -like 'Not found.*') "a missing reused workspace was not flagged: $($workspaceRow | ConvertTo-Json -Compress)"
+    Assert-True (@($report.Prerequisites | Where-Object Item -like 'secondary log workspace*').Count -eq 0) 'a workspace check ran for a region that creates its workspace'
+    $report = Invoke-Inventory $parametersFile @('primaryLogWorkspaceId=/subscriptions/sub/notResourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/log')
+    $workspaceRow = @($report.Prerequisites | Where-Object Item -eq 'primary log workspace')
+    Assert-True ($workspaceRow.Count -eq 1 -and $workspaceRow[0].Status -eq 'Action required' -and $workspaceRow[0].Detail -like '*must be the resource ID of a Log Analytics workspace*') "a malformed workspace ID was not flagged: $($workspaceRow | ConvertTo-Json -Compress)"
+    Assert-True (@($global:InventoryAzCalls | Where-Object { $_ -like 'resource show --ids *notResourceGroups*' }).Count -eq 0) 'a malformed workspace ID was looked up'
+
+    $fakeAzRules = $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a') -SecondaryEndpoints @('pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    Assert-True ((Get-Status $report 'primary job copy path*') -contains 'Action required') 'a hub-only primary copy path was accepted'
+    Assert-True ((Get-Status $report 'secondary job copy path*') -contains 'Action required') 'a hub-only secondary copy path was accepted'
+
+    # Workload profiles environments accept an existing delegated subnet down to /27.
+    $subnetRules = @(
+        (New-Rule 'network vnet subnet show --resource-group rg-network-primary *' @{ addressPrefix = '10.1.4.0/26'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); serviceAssociationLinks = @() }),
+        (New-Rule 'network vnet subnet show --resource-group rg-network-secondary *' @{ addressPrefix = '10.2.4.0/28'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); serviceAssociationLinks = @() })
+    )
+    $fakeAzRules = $commonRules + $subnetRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    Assert-True ((Get-Status $report 'primary Container Apps subnet snet-jobs') -contains 'Ready') 'a delegated /26 subnet was not accepted'
+    Assert-True ((Get-Status $report 'secondary Container Apps subnet snet-jobs') -contains 'Action required') 'a delegated /28 subnet was accepted'
+
+    # Container Apps needs its outbound dependencies, such as mcr.microsoft.com, from the job subnet. A default route to a
+    # firewall needs them allowed there, and a default route that drops internet traffic blocks them.
+    $routeTableRoot = "$subscription/resourceGroups/rg-network/providers/Microsoft.Network/routeTables"
+    function Get-RoutedSubnetRules([string]$PrimaryTable, [string]$SecondaryTable) {
+        @(
+            (New-Rule 'network vnet subnet show --resource-group rg-network-primary *' @{ addressPrefix = '10.0.0.0/23'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); serviceAssociationLinks = @(); routeTable = @{ id = "$routeTableRoot/$PrimaryTable" } }),
+            (New-Rule 'network vnet subnet show --resource-group rg-network-secondary *' @{ addressPrefix = '10.0.0.0/23'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); serviceAssociationLinks = @(); routeTable = @{ id = "$routeTableRoot/$SecondaryTable" } }),
+            (New-Rule "network route-table show --ids $routeTableRoot/rt-firewall *" @{ routes = @(@{ name = 'to-on-premises'; addressPrefix = '192.168.0.0/16'; nextHopType = 'VirtualNetworkGateway' }, @{ name = 'default-to-firewall'; addressPrefix = '0.0.0.0/0'; nextHopType = 'VirtualAppliance'; nextHopIpAddress = '10.100.0.4' }) }),
+            (New-Rule "network route-table show --ids $routeTableRoot/rt-blackhole *" @{ routes = @(@{ name = 'drop-internet'; addressPrefix = '0.0.0.0/0'; nextHopType = 'None' }) }),
+            (New-Rule "network route-table show --ids $routeTableRoot/rt-internet *" @{ routes = @(@{ name = 'internet'; addressPrefix = '0.0.0.0/0'; nextHopType = 'Internet' }) }),
+            (New-Rule "network route-table show --ids $routeTableRoot/rt-unreadable *" 'ERROR: (AuthorizationFailed) The client does not have authorization to read the route table.' 1)
+        )
+    }
+    $fakeAzRules = $commonRules + (Get-RoutedSubnetRules 'rt-firewall' 'rt-blackhole') + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-jobs')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Warning' -and $outboundRow[0].Detail -like '*network appliance at 10.100.0.4, through route default-to-firewall in route table rt-firewall*' -and $outboundRow[0].Detail -like '*mcr.microsoft.com, *.data.mcr.microsoft.com, packages.aks.azure.com, and acs-mirror.azureedge.net*') "a job subnet routed through a firewall was not flagged: $($outboundRow | ConvertTo-Json -Compress)"
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'secondary outbound access from snet-jobs')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Action required' -and $outboundRow[0].Detail -like '*dropped by route drop-internet in route table rt-blackhole*') "a job subnet that drops internet traffic was not flagged: $($outboundRow | ConvertTo-Json -Compress)"
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 1) "unexpected action items with routed job subnets: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+
+    $fakeAzRules = $commonRules + (Get-RoutedSubnetRules 'rt-internet' 'rt-unreadable') + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $parametersFile
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-jobs')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Ready' -and $outboundRow[0].Detail -like "Route table rt-internet doesn't send internet traffic through a firewall.*") "a job subnet that sends internet traffic directly was not accepted: $($outboundRow | ConvertTo-Json -Compress)"
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'secondary outbound access from snet-jobs')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Not verified' -and $outboundRow[0].Detail -like '*Could not read route table rt-unreadable*') "an unreadable route table was not reported: $($outboundRow | ConvertTo-Json -Compress)"
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 0) "unexpected action items with readable and unreadable route tables: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+
+    # Reuse or create: a new secondary account, VNet, and registry, plus a new job subnet in the existing primary VNet.
+    $hybridParametersFile = Join-Path $workRoot 'hybrid.test.bicepparam'
+    $vnetPrimary = "$subscription/resourceGroups/rg-network-primary/providers/Microsoft.Network/virtualNetworks/vnet-primary"
+    function Set-HybridParameters([string]$SubnetPrefix) {
+        @"
+using './existing.bicep'
+
+param resourceGroupName = 'rg-replication-test'
+param resourceGroupLocation = 'westus2'
+param primaryLocation = 'westus2'
+param secondaryLocation = 'northcentralus'
+param primaryRegionCode = 'pri'
+param secondaryRegionCode = 'sec'
+param primaryStorageAccountName = 'stprimarytest'
+param primaryStorageResourceGroupName = 'rg-storage-primary'
+param primaryFileShareName = 'share'
+param secondaryStorageMode = 'new'
+param secondaryStorageAccountName = 'stnewsecondary'
+param primaryNetworkMode = 'newSubnet'
+param primaryVnetName = 'vnet-primary'
+param primaryVnetResourceGroupName = 'rg-network-primary'
+param primaryInfrastructureSubnetPrefix = '$SubnetPrefix'
+param primaryPrivateEndpointSubnetName = 'snet-endpoints'
+param primaryFileDnsZoneId = '$subscription/resourceGroups/rg-dns-primary/providers/Microsoft.Network/privateDnsZones/privatelink.file.core.windows.net'
+param secondaryNetworkMode = 'new'
+param registryMode = 'new'
+param alertEmailAddresses = ['alerts@replication.test']
+"@ | Set-Content -LiteralPath $hybridParametersFile -Encoding utf8
+    }
+    function Get-HybridRules([bool]$NameAvailable) {
+        $hubRouteTable = "$subscription/resourceGroups/rg-network-primary/providers/Microsoft.Network/routeTables/rt-hub"
+        @(
+            (New-Rule 'network vnet show --resource-group rg-network-primary*' @{
+                id = $vnetPrimary; location = 'westus2'; dhcpOptions = @{ dnsServers = @() }; virtualNetworkPeerings = @()
+                addressSpace = @{ addressPrefixes = @('10.1.0.0/16') }
+                subnets = @(@{ name = 'snet-jobs-in-use'; addressPrefix = '10.1.0.0/23' }, @{ name = 'snet-endpoints'; addressPrefix = '10.1.2.0/24'; delegations = @(); routeTable = @{ id = $hubRouteTable } })
+            }),
+            (New-Rule "network route-table show --ids $hubRouteTable *" @{ routes = @(@{ name = 'default-to-firewall'; addressPrefix = '0.0.0.0/0'; nextHopType = 'VirtualAppliance'; nextHopIpAddress = '10.100.0.4' }) }),
+            (New-Rule 'storage account check-name --name stnewsecondary*' @{ nameAvailable = $NameAvailable; message = 'The storage account named stnewsecondary is already taken.' }),
+            (New-Rule 'rest --method get --url *Microsoft.Storage/skus*' @{ value = @(@{ name = 'Standard_LRS'; kind = 'StorageV2'; locations = @('northcentralus'); restrictions = @() }) }),
+            (New-Rule 'network vnet list*' @(@{ name = 'vnet-primary'; addressSpace = @{ addressPrefixes = @('10.1.0.0/16') } })),
+            (New-Rule "network private-dns link vnet list --subscription 00000000-0000-0000-0000-000000000000 --resource-group rg-dns-primary --zone-name privatelink.file.core.windows.net *" @(@{ virtualNetwork = @{ id = $vnetPrimary } }))
+        )
+    }
+
+    Set-HybridParameters '10.1.4.0/23'
+    $fakeAzRules = $commonRules + (Get-HybridRules $true) + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @())
+    $report = Invoke-Inventory $hybridParametersFile
+    Assert-True ((Get-Status $report 'secondary account stnewsecondary') -contains 'To be created') 'a new storage account was not reported as to be created'
+    Assert-True ((Get-Status $report 'Standard_LRS in northcentralus') -contains 'Ready') 'the new account SKU was not checked'
+    Assert-True ((Get-Status $report 'primary Container Apps subnet snet-replication-jobs (new)') -contains 'To be created') 'a free subnet prefix was not accepted'
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-replication-jobs (new)')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Warning' -and $outboundRow[0].Detail -like 'Other subnets in vnet-primary use route table rt-hub, whose internet traffic goes to the network appliance at 10.100.0.4.*') "a new job subnet in a VNet whose subnets use a firewall was not flagged: $($outboundRow | ConvertTo-Json -Compress)"
+    Assert-True ((Get-Status $report 'primary endpoint subnet snet-endpoints') -contains 'To be created') 'the endpoint subnet for new endpoints was not checked'
+    Assert-True ((Get-Status $report 'primary file DNS zone for new endpoints') -contains 'Ready') 'a linked DNS zone for new endpoints was not accepted'
+    Assert-True ((Get-Status $report 'primary registry DNS zone for new endpoints') -contains 'Warning') 'a missing registry DNS zone was not flagged'
+    Assert-True ((Get-Status $report 'secondary VNet vnet-replication-sec (new)') -contains 'To be created') 'a new VNet was not reported as to be created'
+    Assert-True ((Get-Status $report 'Registry (new)') -contains 'To be created') 'a new registry was not reported as to be created'
+    Assert-True ((Get-Status $report 'primary job copy path*') -contains 'Ready') 'an existing source endpoint plus a created destination endpoint was not accepted'
+    Assert-True ((Get-Status $report 'secondary job copy path*') -contains 'Ready') 'endpoints created in a new VNet were not accepted'
+    Assert-True ((Get-Status $report '*job registry path') -notcontains 'Action required') 'endpoints created for a new registry were not accepted'
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 0) "unexpected hybrid action items: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+    $subscriptionRow = @(Get-PermissionRows $report | Where-Object Item -eq 'Role assignments on subscription Test subscription')
+    Assert-True ($subscriptionRow.Count -eq 1 -and $subscriptionRow[0].Detail -like '*Storage File Data Privileged Contributor and AcrPull*') "the new account and registry in a group the deployment creates were not checked together at the subscription: $($subscriptionRow | ConvertTo-Json -Compress)"
+    Assert-True ((Get-Status $report 'Role assignments on primary storage account stprimarytest') -contains 'Ready') 'the reused primary account was not checked in the hybrid layout'
+
+    # A job subnet that an earlier deployment created is checked by its own route table, not by those of other subnets.
+    $primaryRouteTables = "$subscription/resourceGroups/rg-network-primary/providers/Microsoft.Network/routeTables"
+    function Get-HybridVnetRule([object[]]$ExtraSubnets) {
+        New-Rule 'network vnet show --resource-group rg-network-primary*' @{
+            id = $vnetPrimary; location = 'westus2'; dhcpOptions = @{ dnsServers = @() }; virtualNetworkPeerings = @()
+            addressSpace = @{ addressPrefixes = @('10.1.0.0/16') }
+            subnets = @(@{ name = 'snet-jobs-in-use'; addressPrefix = '10.1.0.0/23' }, @{ name = 'snet-endpoints'; addressPrefix = '10.1.2.0/24'; delegations = @(); routeTable = @{ id = "$primaryRouteTables/rt-hub" } }) + $ExtraSubnets
+        }
+    }
+    $droppingRouteRule = New-Rule "network route-table show --ids $primaryRouteTables/rt-drop *" @{ routes = @(@{ name = 'drop-internet'; addressPrefix = '0.0.0.0/0'; nextHopType = 'None' }) }
+    $unreadableHubRule = New-Rule "network route-table show --ids $primaryRouteTables/rt-hub *" 'ERROR: (AuthorizationFailed) The client does not have authorization to read the route table.' 1
+    $createdSubnet = @{ name = 'snet-replication-jobs'; addressPrefix = '10.1.4.0/23'; delegations = @(@{ serviceName = 'Microsoft.App/environments' }); routeTable = @{ id = "$primaryRouteTables/rt-drop" } }
+    $fakeAzRules = @((Get-HybridVnetRule @($createdSubnet)), $droppingRouteRule) + $commonRules + (Get-HybridRules $true) + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @())
+    $report = Invoke-Inventory $hybridParametersFile
+    Assert-True ((Get-Status $report 'primary Container Apps subnet snet-replication-jobs (new)') -contains 'Ready') 'a job subnet created by an earlier deployment was not accepted'
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-replication-jobs')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Action required' -and $outboundRow[0].Detail -like '*dropped by route drop-internet in route table rt-drop*') "a created job subnet that drops internet traffic was not flagged: $($outboundRow | ConvertTo-Json -Compress)"
+    Assert-True (@($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-replication-jobs (new)').Count -eq 0) 'a created job subnet was also checked against the route tables of other subnets'
+    Assert-True ($report.Summary.PrerequisitesActionRequired -eq 1) "unexpected action items with a created job subnet: $(@($report.Prerequisites | Where-Object Status -eq 'Action required' | ForEach-Object Item) -join '; ')"
+
+    # For a subnet still to be created, other subnets' route tables that drop internet traffic or can't be read are reported.
+    $droppingSibling = @{ name = 'snet-other'; addressPrefix = '10.1.3.0/24'; delegations = @(); routeTable = @{ id = "$primaryRouteTables/rt-drop" } }
+    $fakeAzRules = @((Get-HybridVnetRule @($droppingSibling)), $droppingRouteRule, $unreadableHubRule) + $commonRules + (Get-HybridRules $true) + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @())
+    $report = Invoke-Inventory $hybridParametersFile
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-replication-jobs (new)')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Warning' -and $outboundRow[0].Detail -like 'Other subnets in vnet-primary use route table rt-drop, whose internet traffic is dropped.*' -and $outboundRow[0].Detail -like '*Could not read route table rt-hub, which other subnets in vnet-primary also use.*') "a dropping or unreadable route table on other subnets was not reported: $($outboundRow | ConvertTo-Json -Compress)"
+
+    $fakeAzRules = @($unreadableHubRule) + $commonRules + (Get-HybridRules $true) + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @())
+    $report = Invoke-Inventory $hybridParametersFile
+    $outboundRow = @($report.Prerequisites | Where-Object Item -eq 'primary outbound access from snet-replication-jobs (new)')
+    Assert-True ($outboundRow.Count -eq 1 -and $outboundRow[0].Status -eq 'Not verified' -and $outboundRow[0].Detail -like 'Could not read route table rt-hub, which other subnets in vnet-primary use.*') "an unreadable route table on other subnets was not reported: $($outboundRow | ConvertTo-Json -Compress)"
+
+    Set-HybridParameters '10.1.2.0/25'
+    $fakeAzRules = $commonRules + (Get-HybridRules $false) + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @())
+    $report = Invoke-Inventory $hybridParametersFile
+    Assert-True ((Get-Status $report 'primary Container Apps subnet snet-replication-jobs (new)') -contains 'Action required') 'an overlapping subnet prefix was accepted'
+    Assert-True ((Get-Status $report 'secondary account stnewsecondary') -contains 'Action required') 'an unavailable storage account name was accepted'
+
+    # Resource group layout: new services in their own groups, listed existing groups, and custom names.
+    $layoutParametersFile = Join-Path $workRoot 'layout.test.bicepparam'
+    @"
+using './existing.bicep'
+
+param resourceGroupName = 'rg-replication-test'
+param resourceGroupLocation = 'westus2'
+param secondaryResourceGroupName = 'rg-replication-sec'
+param existingResourceGroups = ['rg-shared', 'rg-missing']
+param primaryLocation = 'westus2'
+param secondaryLocation = 'northcentralus'
+param primaryRegionCode = 'pri'
+param secondaryRegionCode = 'PRI'
+param primaryStorageMode = 'new'
+param primaryStorageAccountName = 'stnewprimary'
+param primaryStorageResourceGroupName = 'rg-shared'
+param secondaryStorageMode = 'new'
+param secondaryStorageResourceGroupName = 'rg-missing'
+param primaryNetworkMode = 'new'
+param primaryDnsResourceGroupName = 'rg-dns'
+param secondaryNetworkMode = 'new'
+param secondaryDnsResourceGroupName = 'RG-DNS'
+param registryMode = 'new'
+param registryResourceGroupName = 'rg-foreign'
+param resourceNames = {
+  primaryJob: 'Job--Invalid'
+  secondaryJob: 'job-sync-secondary'
+}
+param alertEmailAddresses = ['alerts@replication.test']
+"@ | Set-Content -LiteralPath $layoutParametersFile -Encoding utf8
+    $fakeAzRules = $commonRules + @(
+        (New-Rule 'group show --name rg-shared *' @{ name = 'rg-shared'; tags = @{} }),
+        (New-Rule 'group show --name rg-foreign *' @{ name = 'rg-foreign'; tags = @{ Owner = 'another-team' } }),
+        (New-Rule 'group show --name rg-dns *' @{ name = 'rg-dns' }),
+        (New-Rule 'group show --name rg-replication-test *' @{ name = 'rg-replication-test'; tags = @{ Workload = 'azure-files-dr-replication' } }),
+        (New-Rule 'network private-dns zone list --resource-group rg-dns *' @(@{ name = 'privatelink.blob.core.windows.net'; tags = @{} })),
+        (New-Rule 'storage account show --name stnewprimary --resource-group rg-shared *' @{ name = 'stnewprimary' }),
+        (New-Rule 'rest --method get --url *Microsoft.Storage/skus*' @{ value = @(@{ name = 'Standard_LRS'; kind = 'StorageV2'; locations = @('westus2', 'northcentralus'); restrictions = @() }) })
+    )
+    $report = Invoke-Inventory $layoutParametersFile
+    Assert-True ((Get-Status $report 'Resource group rg-shared') -contains 'Ready') 'a listed existing resource group was not accepted'
+    Assert-True ((Get-Status $report 'Resource group rg-missing') -contains 'Action required') 'a listed resource group that does not exist was accepted'
+    Assert-True ((Get-Status $report 'Resource group rg-foreign') -contains 'Warning') 'an unlisted existing resource group was not flagged'
+    Assert-True ((Get-Status $report 'Resource group rg-replication-test') -contains 'Ready') 'a resource group created by an earlier deployment was not accepted'
+    Assert-True ((Get-Status $report 'Resource group rg-replication-sec') -contains 'To be created') 'a new secondary resource group was not reported as to be created'
+    Assert-True (@(Get-Status $report 'Resource group *').Count -eq 6) "resource groups were not deduplicated: $(@($report.Prerequisites | Where-Object Item -like 'Resource group *' | ForEach-Object Item) -join '; ')"
+    Assert-True ((Get-Status $report 'DNS resource group rg-dns') -contains 'Action required') 'a shared DNS resource group for two new VNets was accepted'
+    Assert-True ((Get-Status $report 'primary DNS resource group rg-dns') -contains 'Warning') 'foreign private DNS zones in the DNS resource group were not flagged'
+    Assert-True ((Get-Status $report 'Region codes') -contains 'Action required') 'identical region codes were accepted'
+    Assert-True ((Get-Status $report "resourceNames.primaryJob 'Job--Invalid'") -contains 'Action required') 'an invalid custom job name was accepted'
+    Assert-True (@(Get-Status $report 'resourceNames.secondaryJob*').Count -eq 0) 'a valid custom job name was flagged'
+    Assert-True ((Get-Status $report 'primary account stnewprimary') -contains 'Ready') 'a new account was not looked up in its own resource group'
+    $secondaryAccount = @($report.Prerequisites | Where-Object Item -eq 'secondary account (new)')
+    Assert-True ($secondaryAccount.Count -eq 1 -and $secondaryAccount[0].Status -eq 'To be created' -and $secondaryAccount[0].Detail -like '* in rg-missing.') 'a new account without a name was not placed in its resource group'
+    Assert-True ((Get-Status $report 'Registry (new)') -contains 'To be created') 'a new registry in a custom resource group was not reported as to be created'
+    $layoutPermissionItems = @(Get-PermissionRows $report | ForEach-Object Item)
+    Assert-True ($layoutPermissionItems.Count -eq 3 -and $layoutPermissionItems -contains 'Role assignments on resource group rg-shared' -and $layoutPermissionItems -contains 'Role assignments on resource group rg-foreign' -and $layoutPermissionItems -contains 'Role assignments on subscription Test subscription') "new services were not checked in their resource groups: $($layoutPermissionItems -join '; ')"
+
+    # A placeholder that an override replaces no longer blocks lookups and what-if.
+    $placeholderFile = Join-Path $workRoot 'existing.placeholder.bicepparam'
+    (Get-Content -LiteralPath $parametersFile -Raw) -replace "param containerImage = '[^']+'", "param containerImage = '<existing-acr-login-server>/<repository>@sha256:<digest>'" | Set-Content -LiteralPath $placeholderFile -Encoding utf8
+    $fakeAzRules = $commonRules + (Get-ExistingRules -PrimaryEndpoints @('pe-primary-file-a', 'pe-primary-file-b') -SecondaryEndpoints @('pe-secondary-file-a', 'pe-secondary-file-b'))
+    $report = Invoke-Inventory $placeholderFile
+    Assert-True ((Get-Status $report 'existing.placeholder.bicepparam') -contains 'Action required') 'the placeholder image was not flagged without an override'
+    $report = Invoke-Inventory $placeholderFile @("containerImage=acrtest.azurecr.io/azure-files-dr-azcopy@sha256:$digest", 'activeRegion=primary', 'acrPublicNetworkAccess=Disabled')
+    Assert-True ((Get-Status $report 'existing.placeholder.bicepparam') -contains 'Ready') 'an overridden placeholder was still reported'
+    Assert-True ((Get-Status $report 'containerImage') -contains 'Ready') 'the override image was not checked'
+    $whatIfCall = Get-WhatIfCall
+    Assert-True ($whatIfCall -like "*--parameters containerImage=acrtest.azurecr.io/azure-files-dr-azcopy@sha256:$digest activeRegion=primary acrPublicNetworkAccess=Disabled --result-format*") "what-if did not receive the existing-profile overrides: $whatIfCall"
+} finally {
+    Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host 'Inventory script checks passed.'

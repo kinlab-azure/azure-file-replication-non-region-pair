@@ -1,0 +1,189 @@
+# Infrastructure plan
+
+## Scope
+
+Deploy private, active/passive Azure Files replication across two selected Azure regions. The regions do not need to form an Azure paired-region set. The primary region is authoritative initially, and the secondary region can become authoritative during failover and run reverse synchronization after the primary region returns.
+
+## Topology
+
+- One workload resource group for replication compute and supporting resources. The existing-resource profile can also use one resource group per region or per service.
+- One split-horizon Private DNS resource group per region in a greenfield deployment.
+- One VNet per region with a delegated `default` subnet and a `storage` private endpoint subnet.
+- No VNet peering.
+- One Azure Files account/share and one blob account/container per region.
+- Each VNet has Azure Files private endpoints for both file accounts.
+- Each VNet has its own same-named Private DNS zone instance. This split-horizon design prevents an unpeered VNet from resolving the other region's unreachable private endpoint address.
+- One internal Container Apps environment and AzCopy job per region. Each environment is a workload profiles environment on its delegated subnet and runs the job on the serverless Consumption profile. Environment zone redundancy is disabled to reduce regional capacity requirements; resilience is provided by the independent regional workers.
+- A greenfield deployment uses ZRS for primary storage and LRS for secondary storage. Confirm those SKUs are available in the selected regions before deployment.
+- A Premium ACR in the primary region with geo-replication to the secondary region and a private endpoint in each VNet.
+- Regional Log Analytics workspaces.
+- One shared Azure Monitor email Action Group, two job-failure metric alerts, and one freshness query alert per regional workspace.
+
+The existing-resource profile keeps this topology but reuses what already exists. For each storage account and share, regional network, and the registry, a mode parameter either reuses the service or creates it as a greenfield deployment would. A new VNet gets its own split-horizon zones. `newSubnet` adds only a delegated job subnet to an existing VNet. Private endpoints are created for every new service and in every new VNet, which keeps the local-endpoint layout below for them. The exception is an existing registry that the jobs reach through its public endpoint, with `registryPrivateEndpointsEnabled = false`, which gets no endpoints.
+
+Most resources that the deployment creates can take custom names. Each region's compute, which is its identity, Log Analytics workspace, Container Apps environment, and job, goes in that region's resource group; both regions can share one group. Monitoring goes with the primary region's compute. New storage accounts, VNets, the registry, private endpoints, and private DNS zones can each go in a resource group of their own. See [Reuse or create each service](../deploy/bicep/README.md#reuse-or-create-each-service) and [Customize the parameter file](../deploy/bicep/README.md#customize-the-parameter-file) in the README.
+
+Container Apps environments on a VNet are workload profiles environments, which need a subnet of at least `/27` delegated to `Microsoft.App/environments`. Greenfield deployments and new VNets use a `/23` job subnet.
+
+### Server-side copy requirement
+
+AzCopy copies file data directly between the two storage services. With private endpoints, each job's network must have private access to both storage accounts in one of two layouts:
+
+- **Local endpoints.** The job VNet contains private endpoints for both accounts, and DNS in that VNet resolves both account names to them. A greenfield deployment uses this layout with split-horizon DNS.
+- **Direct peering.** The job runs in the VNet that contains its source account's private endpoint, and the two regional VNets are directly peered.
+
+Reaching the other region only through a hub VNet or Virtual WAN hub fails with `403 CannotVerifyCopySource`. For the existing-resource profile, confirm one of these layouts before deployment; see the [README](../README.md#network-requirements-for-server-side-copy).
+
+### Outbound dependencies
+
+The storage traffic, and the registry traffic unless the existing-resource profile sets `registryPrivateEndpointsEnabled = false`, stays on private endpoints, but Container Apps also needs outbound HTTPS from the job subnets to Microsoft Artifact Registry, its Kubernetes binary downloads, and Microsoft Entra ID for the job identities. None of these has a private endpoint. The environments also send the job logs, which the freshness alert queries, to Azure Monitor. A greenfield deployment's VNets reach them directly; where a job subnet's internet traffic goes through a firewall, the firewall must allow them. The [README](../README.md#outbound-access-through-a-firewall) lists them, and the inventory check reports job subnets in existing VNets that route internet traffic through a firewall.
+
+## RBAC and service permissions
+
+### Runtime managed identities
+
+Each regional Container Apps Job runs as a user-assigned managed identity. By default, the deployment creates both identities and all runtime role assignments, so operators don't grant them separately. The existing-resource profile can reuse identities that already exist instead (`identityMode = 'existing'`), and with `createRoleAssignments = false`, either profile leaves the assignments to an access administrator, who grants them once with `scripts/grant-access.ps1`.
+
+| Principal | Built-in role | Scope | Reason |
+| --- | --- | --- | --- |
+| Primary job identity | Storage File Data Privileged Contributor (`69566ab7-960f-475b-8e7c-b3118f30c6bd`) | Primary file storage account | Read or write file data while primary is active or during failback |
+| Primary job identity | Storage File Data Privileged Contributor (`69566ab7-960f-475b-8e7c-b3118f30c6bd`) | Secondary file storage account | Write or read file data while primary is active or during failover |
+| Secondary job identity | Storage File Data Privileged Contributor (`69566ab7-960f-475b-8e7c-b3118f30c6bd`) | Primary file storage account | Write or read file data while secondary is active or during failback |
+| Secondary job identity | Storage File Data Privileged Contributor (`69566ab7-960f-475b-8e7c-b3118f30c6bd`) | Secondary file storage account | Read or write file data while secondary is active or during failover |
+| Primary job identity | AcrPull (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | ACR | Pull the digest-pinned worker image |
+| Secondary job identity | AcrPull (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | ACR | Pull the digest-pinned worker image |
+
+The storage role is a data-plane role. Contributor, Storage Account Contributor, or another management-plane role alone cannot authorize AzCopy file operations. Both job identities intentionally receive the role on both accounts because replication direction changes during failover. The role is assigned at storage-account scope because each account contains the single replication share managed by this solution. A registry with ABAC repository permissions ignores AcrPull; the identities need Container Registry Repository Reader there instead.
+
+Every deployment lists these six assignments in its `jobRoleAssignments` output, with the names that the templates give them, whether or not it creates them.
+
+### Deployment principal
+
+The deployment principal performs subscription-scope deployments. With `createRoleAssignments = true`, the default, it also creates the job identities' role assignments. Use one of these models:
+
+| Model | Assignment | Notes |
+| --- | --- | --- |
+| Simple | Owner at the deployment subscription | Covers resource-group creation, resource deployment, and role assignment creation |
+| Separated | Contributor plus Role Based Access Control Administrator at the deployment subscription | Separates resource management from access management; equivalent custom roles are also valid |
+| Constrained | Contributor on the replication resource groups, plus Role Based Access Control Administrator with a condition that allows only AcrPull and Storage File Data Privileged Contributor for service principals, on each storage account and the registry | Limits delegated access management to the six assignments the deployment creates; the README shows the [condition](../README.md#deploying-identity-that-assigns-the-roles). The condition doesn't limit the principals, so a pipeline identity could grant itself those roles. |
+| Separately granted roles | Contributor-level rights only, with `createRoleAssignments = false`; see the [pipeline identity rights](../README.md#pipeline-identity-rights) | The deployment creates no role assignments, so neither deployments nor direction switches need the right to create them. An access administrator grants the six assignments once. |
+
+The deployment principal can be a user, a service principal, or a managed identity; Microsoft Entra ID represents managed identities as service principals, so the same roles apply. The README describes how to [deploy with a pipeline identity](../deploy/bicep/README.md#deploy-with-a-pipeline-identity).
+
+At minimum, an equivalent custom deployment role must allow:
+
+- subscription-scope deployments and resource-group creation;
+- creation and update of the storage, network, private DNS, managed identity, ACR, Log Analytics, Container Apps, and Azure Monitor resources declared by the selected profile;
+- `Microsoft.ManagedIdentity/userAssignedIdentities/assign/action` so the two identities can be attached to the regional jobs;
+- with `createRoleAssignments = true`, `Microsoft.Authorization/roleAssignments/write` and `Microsoft.Authorization/roleAssignments/delete` at each storage-account and ACR scope; and
+- read access to every existing resource referenced by the brownfield profile.
+
+With `createRoleAssignments = true`, the existing-resource profile also executes nested deployments in the resource groups containing the reused storage accounts and ACR. In both modes, it executes nested deployments in the resource group of a VNet that gets a new job subnet, and in every resource group that receives resources it creates. The deployment principal therefore needs resource-group deployment permission in those resource groups, and, when it creates role assignments, role-assignment permission on the target resources. The current template accepts resource-group names but not subscription IDs, so the workload and every reused storage account, network resource, private endpoint, ACR, and job identity must be in the same subscription. Private DNS zones named by resource ID can be in another subscription.
+
+When the existing-resource profile creates services, it places each one in its own resource group parameter or else in its region's resource group, and it places the private endpoints it creates in the endpoint resource group of their VNet. A new VNet's split-horizon zones go in their own DNS resource groups. The deployment creates each of these resource groups unless it's listed in `existingResourceGroups`; see the [README](../deploy/bicep/README.md#choose-the-resource-groups). The principal also needs:
+
+- `Microsoft.Network/virtualNetworks/subnets/join/action` on each endpoint subnet, and on each existing job subnet that gets a Container Apps environment;
+- subnet write access on a VNet in `newSubnet` mode;
+- Private DNS Zone Contributor on the zones that receive the new endpoints' records; and
+- `privateEndpointConnectionsApproval/action` on reused storage accounts and registries that get new endpoints. The template requests automatic approval, so without this right the endpoint creation fails with `LinkedAuthorizationFailed` instead of waiting for approval.
+
+The README's [troubleshooting section](../deploy/bicep/README.md#deployment-errors) maps the resulting authorization errors to the missing rights.
+
+Validation and what-if can't confirm the role assignment rights. The nested deployments that create the assignments depend on the job identities' principal IDs, which exist only once the deployment runs, so Azure reports them as `NestedDeploymentShortCircuited` and checks their permissions only when it starts them. A missing right therefore fails the deployment after the identities are created, before any job exists. `scripts/inventory.ps1` checks these rights beforehand, and `scripts/deploy.ps1` and `scripts/switch-direction.ps1` list the refused scopes when a deployment fails on them.
+
+### Access administrator
+
+With `createRoleAssignments = false`, an access administrator grants the six job identity assignments once, with `scripts/grant-access.ps1`: after the first deployment, from that deployment's `jobRoleAssignments` output, or before it, for reused identities and existing storage accounts and registry, from their resource IDs. The administrator needs `Microsoft.Authorization/roleAssignments/write` on both storage accounts and the registry, through Owner, User Access Administrator, or Role Based Access Control Administrator, which can be constrained to the two roles. The script creates only missing assignments, and makes no Microsoft Graph calls. Because the deployment principal controls a deployment's outputs, the script grants only the two job roles, on storage accounts and registries in the current subscription, to user-assigned identities in it, and it shows the identities as Azure reports them, so that the administrator can confirm them with `-WhatIf` before granting.
+
+`scripts/deploy.ps1` checks the assignments after its bootstrap deployment and before it builds the image or activates the schedule. If any are missing, it closes a registry that the templates create and that it opened for the build, prints the grant command, and stops; rerunning it after the grant completes the deployment. Until then, both jobs stay unscheduled.
+
+### Deployment script and ACR
+
+`scripts/deploy.ps1` can either consume a prebuilt digest-pinned image or run an ACR Task build and inspect its manifest:
+
+- With `-ContainerImage`, no image build or manifest lookup is performed, and a registry that the templates create stays closed to public network access in both deployment stages. The deployment principal still needs the management-plane permissions above, and with `createRoleAssignments = true`, the role-assignment permissions.
+- Without `-ContainerImage`, the principal must be able to queue an ACR Task build, push the resulting image, and read repository manifest metadata: Container Registry Tasks Contributor plus AcrPush on the registry, or Container Registry Repository Writer instead of AcrPush for a registry with repository-scoped ABAC. Contributor on a registry without ABAC covers both. Network access to the private registry must also be available from the command environment. A registry that the templates create is opened to public network access for the bootstrap deployment and the build, and closed again by the final deployment, or by a hold deployment when the job identities' roles are still missing.
+
+### Operational access
+
+- `scripts/switch-direction.ps1` performs another subscription deployment. The failover operator therefore needs the same deployment permissions described above. With `createRoleAssignments = true`, that includes role assignment rights on both storage accounts and the registry; confirm them, and activate any eligible Privileged Identity Management role in a test, before an outage. A switch that fails on these rights leaves the replication direction unchanged, because the jobs deploy only after their role assignments. With `createRoleAssignments = false`, a switch doesn't touch the role assignments, and the script warns afterward if a job identity lacks one.
+- Starting a job requires `Microsoft.App/jobs/start/action`, which is privileged: a start request can override the image, command, and environment variables, and the execution runs as the job's managed identity with data access to both shares. Grant start and stop rights only to replication operators. Starting the standby job without an override performs a real reverse synchronization; use a `DRY_RUN=true` execution override for readiness tests.
+- Users investigating failures need read access to the Container Apps Jobs, alert resources, and Log Analytics workspaces. Querying workspace data also requires a Log Analytics data-query role, such as Log Analytics Reader, at the workspace or a parent scope.
+
+### Integrations without additional runtime RBAC
+
+- Container Apps sends logs to Log Analytics using workspace credentials configured by Bicep. No role is assigned to either job identity for this path.
+- Azure Monitor metric and scheduled-query alerts invoke the Action Group through the platform alerting service. No managed identity or additional role assignment is used.
+- Email receivers do not require Azure RBAC, but recipients should confirm and test delivery before production use.
+- Private endpoint and Private DNS access is controlled by network configuration rather than data-plane RBAC. RBAC does not compensate for missing endpoint approval, routes, or DNS records.
+
+### Verify assignments
+
+After deployment, list the assignments that the job identities need, and check which exist, with the name of the latest deployment:
+
+```powershell
+pwsh ./scripts/grant-access.ps1 -DeploymentName '<deployment-name>' -WhatIf
+```
+
+Or resolve the two job identity principal IDs and verify that each has the two storage assignments and one registry assignment:
+
+```powershell
+az identity list --resource-group <replication-resource-group> --query "[].{name:name, principalId:principalId}" --output table
+az identity list --resource-group <secondary-resource-group> --query "[].{name:name, principalId:principalId}" --output table
+```
+
+The second command is needed only when the existing-resource profile uses a separate `secondaryResourceGroupName`.
+
+```powershell
+az role assignment list --scope "/subscriptions/<subscription-id>/resourceGroups/<primary-storage-rg>/providers/Microsoft.Storage/storageAccounts/<primary-storage-account>" --include-inherited --output table
+az role assignment list --scope "/subscriptions/<subscription-id>/resourceGroups/<secondary-storage-rg>/providers/Microsoft.Storage/storageAccounts/<secondary-storage-account>" --include-inherited --output table
+az role assignment list --scope "/subscriptions/<subscription-id>/resourceGroups/<acr-rg>/providers/Microsoft.ContainerRegistry/registries/<acr-name>" --include-inherited --output table
+```
+
+## Replication state
+
+Only one job is scheduled at a time:
+
+| State | Scheduled job | Direction |
+| --- | --- | --- |
+| Normal | Primary region | Primary to secondary |
+| DR active | Secondary region | Secondary to primary |
+
+The schedule starts every 10 minutes. This is a cadence, not a guaranteed RPO. A previous execution can still be running when the next schedule is due; Container Apps Jobs is configured for one replica per execution, and operators must monitor duration.
+
+Destination deletion is disabled. The initial rollout prioritizes recoverability over mirroring source deletions.
+
+## Monitoring state
+
+Job failure and replication freshness are separate signals:
+
+- Each Container Apps Job has a Sev 1 metric alert over the native `Executions` metric filtered to `state=Failed`. Both rules remain enabled so a failed manual execution in the standby region is observable.
+- Each job's Log Analytics workspace has a Sev 2 scheduled query rule that runs every 10 minutes and searches the configured 20-, 30-, or 60-minute window for `AZURE_FILES_REPLICATION_SUCCEEDED` from that job, identified by its environment and job names. A single evaluation with no success marker triggers the alert. The Bicep existing-resource profile can reuse existing workspaces, such as a central workspace that both jobs share; the rule then runs in the workspace's region.
+- The freshness query embeds the deployment time and treats the active direction as fresh until one lag threshold after it, so a newly activated direction has time to run and ingest its first success. Any redeployment delays stale detection by at most one threshold.
+- Scheduled-query validation is skipped when the alert resources are created because a new workspace does not contain `ContainerAppConsoleLogs_CL` until its first Container Apps log ingestion. Runtime evaluation uses the table normally after it is materialized.
+- Freshness represents elapsed time since the last completed successful AzCopy run. It does not compare individual file timestamps or guarantee a per-file RPO.
+- All rules use stateful auto-mitigation and notify the same email Action Group with Common Alert Schema.
+
+Freshness follows the active/passive state:
+
+| `activeRegion` | Primary failure | Secondary failure | Primary freshness | Secondary freshness |
+| --- | --- | --- | --- | --- |
+| `none` | Enabled | Enabled | Disabled | Disabled |
+| `primary` | Enabled | Enabled | Enabled | Disabled |
+| `secondary` | Enabled | Enabled | Disabled | Enabled |
+
+Direction changes use a full Bicep deployment, so the freshness-rule state changes with the job schedules. No separate alert toggle or DNS change is required.
+
+## Failover controls
+
+Before changing direction:
+
+1. Fence writes to the authoritative share.
+2. Verify neither job has a running execution.
+3. Confirm both jobs use the same digest-pinned image.
+4. Run a final synchronization when the old source is reachable.
+5. Use `scripts/switch-direction.ps1` to enable only the intended regional schedule.
+6. Start or observe one execution and validate representative files before releasing writes.
+7. Confirm the new active direction's freshness alert is enabled and the prior direction's alert is disabled.
+
+Opposing directions must never run concurrently. Conflict reconciliation remains an operator responsibility if both shares received writes.
